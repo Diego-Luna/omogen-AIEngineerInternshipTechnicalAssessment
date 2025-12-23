@@ -4,3 +4,5 @@ sqlmodel
 asyncpg
 python-dotenv
 greenlet
+python-multipart
+pymupdf
