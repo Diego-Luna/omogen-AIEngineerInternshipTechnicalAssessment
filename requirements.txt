@@ -6,3 +6,5 @@ python-dotenv
 greenlet
 python-multipart
 pymupdf
+httpx
+litellm

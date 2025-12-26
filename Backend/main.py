@@ -1,66 +1,76 @@
-from fastapi import FastAPI, Depends, UploadFile, File, HTTPException # <--- AGREGADOS
+from fastapi import FastAPI, Depends, UploadFile, File, HTTPException, Form
 from sqlmodel import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from contextlib import asynccontextmanager
 
 from database import init_db, get_session
-from models import CV # Ya no necesitamos CVCreate si borramos el endpoint manual
+from models import CV, Job
 from utils import extract_text_from_pdf
+from ai_service import extract_cv_data_ai, match_cv_job
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    print("🚀 Iniciando sistema y creando tablas...")
+    print("Starting system...")
     await init_db()
     yield
-    print("🛑 Apagando sistema...")
 
-app = FastAPI(title="CV Filtering AI System", lifespan=lifespan)
+app = FastAPI(lifespan=lifespan)
 
-@app.get("/")
-async def root():
-    return {"message": "API is running", "tech": "FastAPI + AsyncPG"}
+# Endpoint 1: Markdown/Text 
+@app.post("/jobs/upload/")
+async def upload_job(
+    title: str = Form(...),
+    file: UploadFile = File(...),
+    session: AsyncSession = Depends(get_session)
+):
+    content = await file.read()
+    # We assume it is text or markdown (decode bytes to string)
+    text_content = content.decode("utf-8")
+    
+    new_job = Job(title=title, description_text=text_content)
+    session.add(new_job)
+    await session.commit()
+    return {"id": new_job.id, "title": new_job.title}
 
-@app.get("/cvs/", response_model=list[CV])
-async def read_cvs(session: AsyncSession = Depends(get_session)):
-    """Retrieves a list of all CVs currently stored in the database."""
-    result = await session.execute(select(CV))
-    cvs = result.scalars().all()
-    return cvs
-
-@app.post("/upload/")
-async def upload_cv(
-    file: UploadFile = File(...), 
+#  Endpoint 2: match
+@app.post("/match")
+async def match_cv_and_job(
+    cv: UploadFile = File(...),
+    job_description: UploadFile = File(...),
     session: AsyncSession = Depends(get_session)
 ):
     """
-    Sube un PDF, extrae el texto y guarda el registro en la BD.
+    Receive a CV and an Offer on the fly, process them, and return the score.
+    (We also store the data in a database for persistence).
     """
-    # 1. Validar que sea PDF
-    if file.content_type != "application/pdf":
-        raise HTTPException(status_code=400, detail="Only PDF files are allowed")
 
-    # 2. Leer el contenido del archivo
-    content = await file.read()
-
-    # 3. Extraer texto usando nuestra utilidad
-    text = extract_text_from_pdf(content)
-
-    if not text:
-        raise HTTPException(status_code=400, detail="Could not extract text from PDF")
-
-    # 4. Crear el objeto CV en base de datos
+    cv_bytes = await cv.read()
+    cv_text = extract_text_from_pdf(cv_bytes)
+    
+    # 2. Process Job (Text/MD)
+    job_bytes = await job_description.read()
+    job_text = job_bytes.decode("utf-8")
+    
+    # 3. AI: Extract CV data
+    extracted_data = await extract_cv_data_ai(cv_text)
+    
+    # 4. AI: Matching
+    match_result = await match_cv_job(extracted_data, job_text)
+    
+    # 5. Persistence (Save to database)
+    # We keep CV
     new_cv = CV(
-        candidate_name=file.filename, 
-        text_content=text,
-        extracted_data={} 
+        candidate_name=cv.filename,
+        text_content=cv_text,
+        extracted_data=extracted_data,
+        is_processed=True
     )
-
     session.add(new_cv)
+    
+    # We keep Job
+    new_job = Job(title=job_description.filename, description_text=job_text)
+    session.add(new_job)
+    
     await session.commit()
-    await session.refresh(new_cv)
-
-    return {
-        "id": new_cv.id,
-        "filename": new_cv.candidate_name,
-        "text_preview": new_cv.text_content[:200] + "..." 
-    }
+    
+    return match_result
